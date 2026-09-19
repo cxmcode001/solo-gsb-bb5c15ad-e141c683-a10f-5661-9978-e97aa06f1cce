@@ -112,5 +112,74 @@ class BatchList(BaseModel):
     batches: list[BatchSummary]
 
 
+_RISK_LEVELS = ("high", "medium", "low")
+
+
+class PoolPlanRequest(BaseModel):
+    pool_count: int = Field(
+        ..., ge=1, le=10000, description="池数量（至少 1）"
+    )
+    pool_capacity: int = Field(
+        ..., ge=1, le=10000, description="每池容量（每池最多容纳的引物数）"
+    )
+    isolated_risk_levels: list[str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "需隔离的异二聚体风险等级（仅 high/medium/low）；达到这些等级的"
+            "异二聚体两两构成冲突图边，自二聚体忽略。重复值自动去重"
+        ),
+    )
+
+    @field_validator("isolated_risk_levels")
+    @classmethod
+    def _isolated_risk_levels(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        bad: list[str] = []
+        for value in values:
+            level = value.strip().lower()
+            if level not in _RISK_LEVELS:
+                bad.append(value)
+            elif level not in normalized:
+                normalized.append(level)
+        if bad:
+            raise ValueError(
+                "风险等级仅支持 high/medium/low，非法值: "
+                + ", ".join(repr(v) for v in bad)
+            )
+        return normalized
+
+
+class PoolConflictEdgeOut(BaseModel):
+    pool: int = Field(description="冲突所在池号（0 起）")
+    position_a: int = Field(description="引物 A 在批次中的位置")
+    position_b: int = Field(description="引物 B 在批次中的位置")
+    name_a: str
+    name_b: str
+    risk_level: str = Field(description="high / medium / low")
+
+
+class PoolOut(BaseModel):
+    pool: int = Field(description="池号（0 起）")
+    capacity: int
+    members: list[str] = Field(description="池内引物名称（按批次位置升序）")
+    member_positions: list[int] = Field(
+        description="与 members 一一对应的批次位置"
+    )
+    conflict_count: int = Field(description="该池内部的同池冲突边数")
+
+
+class PoolPlanOut(BaseModel):
+    batch_id: str
+    pool_count: int
+    pool_capacity: int
+    isolated_risk_levels: list[str]
+    primer_count: int
+    assigned_count: int = Field(description="实际分配引物数（容量允许时等于引物数）")
+    total_conflicts: int = Field(description="全部池的同池冲突边总数")
+    pools: list[PoolOut]
+    conflicts: list[PoolConflictEdgeOut]
+
+
 class ErrorOut(BaseModel):
     detail: str

@@ -7,6 +7,7 @@ import uuid
 
 from . import db
 from .dimer import PairResult, analyze_pair
+from .pooling import build_pool_plan
 
 
 def _pair_to_row(pair_index: int, r: PairResult) -> tuple:
@@ -95,3 +96,94 @@ def run_batch(
             pair_rows=pair_rows,
         )
     return batch_id
+
+
+def plan_batch_pools(
+    *,
+    batch_id: str,
+    pool_count: int,
+    pool_capacity: int,
+    isolated_risk_levels: list[str],
+) -> dict:
+    """基于已保存批次的异二聚体结果构建冲突图并确定性分池。
+
+    批次不存在返回 None（由路由层转 404）；容量总和不足抛出
+    ValueError（由路由层转 422）。
+    """
+    with db.get_conn() as conn:
+        batch = db.get_batch(conn, batch_id)
+        if batch is None:
+            return None
+        primers = db.get_primers(conn, batch_id)
+        pairs = db.get_pairs(conn, batch_id, risky_only=False)
+
+    n = len(primers)
+    if pool_count * pool_capacity < n:
+        raise ValueError(
+            f"池容量总和 {pool_count}×{pool_capacity}="
+            f"{pool_count * pool_capacity} 不足以容纳 {n} 条引物"
+        )
+
+    # 批次内引物名称唯一（入库时已保证）
+    position_by_name = {row["name"]: row["position"] for row in primers}
+    names_by_position = {pos: name for name, pos in position_by_name.items()}
+
+    # 仅取异二聚体（忽略自二聚体），且风险等级在隔离集合内
+    levels = set(isolated_risk_levels)
+    edges: list[tuple[int, int, str]] = []
+    for row in pairs:
+        if row["is_self_dimer"] or row["risk_level"] not in levels:
+            continue
+        edges.append(
+            (
+                position_by_name[row["name_top"]],
+                position_by_name[row["name_bottom"]],
+                row["risk_level"],
+            )
+        )
+
+    plan = build_pool_plan(
+        primer_count=n,
+        edges=edges,
+        pool_count=pool_count,
+        pool_capacity=pool_capacity,
+    )
+
+    # 每个池的冲突边数
+    conflict_count_by_pool = [0] * pool_count
+    conflicts_out: list[dict] = []
+    for pool_id, edge in plan.conflicts:
+        conflict_count_by_pool[pool_id] += 1
+        conflicts_out.append(
+            {
+                "pool": pool_id,
+                "position_a": edge.position_a,
+                "position_b": edge.position_b,
+                "name_a": names_by_position[edge.position_a],
+                "name_b": names_by_position[edge.position_b],
+                "risk_level": edge.risk_level,
+            }
+        )
+
+    pools_out = [
+        {
+            "pool": pool_id,
+            "capacity": pool_capacity,
+            "members": [names_by_position[pos] for pos in members],
+            "member_positions": members,
+            "conflict_count": conflict_count_by_pool[pool_id],
+        }
+        for pool_id, members in enumerate(plan.pool_members)
+    ]
+
+    return {
+        "batch_id": batch_id,
+        "pool_count": pool_count,
+        "pool_capacity": pool_capacity,
+        "isolated_risk_levels": isolated_risk_levels,
+        "primer_count": n,
+        "assigned_count": sum(len(m) for m in plan.pool_members),
+        "total_conflicts": plan.total_conflicts,
+        "pools": pools_out,
+        "conflicts": conflicts_out,
+    }

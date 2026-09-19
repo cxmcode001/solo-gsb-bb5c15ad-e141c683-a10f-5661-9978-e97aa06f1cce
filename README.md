@@ -5,7 +5,8 @@
 服务枚举每对引物**自二聚体**与**两两异二聚体的全部错位对齐**，按 IUPAC 简并碱基
 **集合语义**判断碱基互补，返回每对的最危险对齐、最长连续互补长度、涉及任一 3′端的
 连续长度及中文风险原因；同分时按固定偏移规则取唯一结果。批次与结果持久化到
-SQLite，支持事后查询。
+SQLite，支持事后查询。对已保存批次还可通过 `POST /api/batches/{id}/pool-plan`
+基于异二聚体结果构建冲突图，按 DSatur 风格确定性贪心把引物分配到若干引物池。
 
 ---
 
@@ -23,6 +24,7 @@ docker compose up --build -d
 | ReDoc 文档 | http://localhost:8000/redoc |
 | 健康检查 | http://localhost:8000/health |
 | 批次接口 | http://localhost:8000/api/batches |
+| 引物分池 | `POST http://localhost:8000/api/batches/{id}/pool-plan` |
 
 > 监听端口 **8000**。SQLite 数据库文件保存在命名卷 `primer-data` 内
 > （容器路径 `/data/primer_dimer.db`）。镜像构建期安装依赖、容器启动期自动建库
@@ -119,6 +121,75 @@ curl -s -X POST http://localhost:8000/api/batches \
 
 ### `GET /api/batches?limit=50&offset=0` — 批次列表（按创建时间倒序）
 
+### `POST /api/batches/{id}/pool-plan` — 对已保存批次做引物分池
+
+对**已保存批次**的异二聚体筛查结果构建冲突图并分池：
+
+* **自二聚体忽略**，只取异二聚体配对；风险等级命中 `isolated_risk_levels`
+  （`high` / `medium` / `low`，可多选、自动去重）的异二聚体两端引物之间连一条冲突边；
+* 贪心选择下一个引物，依次比较 **① 已见邻池数**（相邻引物已占据的不同池数，
+  DSatur saturation）、**② 冲突度**（冲突图中的边数）、**③ 批次位置**（靠前者优先）；
+* 贪心选择放置池，依次比较 **① 新增冲突数**（放入后新产生的同池冲突边数，少者优先）、
+  **② 池内人数**（少者优先）、**③ 池号**（小者优先）；
+* 容量允许（`pool_count × pool_capacity ≥ 引物数`）时**全部引物必被分配**；
+  容量总和不足返回 `422`；批次不存在返回 `404`。全部比较均为全序，相同输入结果稳定可复现。
+
+```bash
+curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../pool-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "pool_count": 3,
+    "pool_capacity": 8,
+    "isolated_risk_levels": ["high", "medium"]
+  }'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `pool_count` | 池数量，≥1 |
+| `pool_capacity` | 每池容量（每池最多引物数），≥1 |
+| `isolated_risk_levels` | 需隔离的异二聚体风险等级列表，取值 `high`/`medium`/`low`，至少 1 个；重复值去重 |
+
+返回示例：
+
+```json
+{
+  "batch_id": "f98cdd27-...",
+  "pool_count": 3,
+  "pool_capacity": 8,
+  "isolated_risk_levels": ["high", "medium"],
+  "primer_count": 3,
+  "assigned_count": 3,
+  "total_conflicts": 0,
+  "pools": [
+    {
+      "pool": 0,
+      "capacity": 8,
+      "members": ["R"],
+      "member_positions": [1],
+      "conflict_count": 0
+    }
+  ],
+  "conflicts": [
+    {
+      "pool": 0,
+      "position_a": 1, "position_b": 4,
+      "name_a": "R", "name_b": "P5",
+      "risk_level": "high"
+    }
+  ]
+}
+```
+
+* `pools[].members` / `member_positions` 为各池成员，按批次位置升序；
+  `conflict_count` 为该池**内部**同池冲突边数；
+* `conflicts` 平铺全部池的同池冲突边（按池号、两端批次位置升序），
+  长度恒等于 `total_conflicts`，也等于各池 `conflict_count` 之和；
+* 容量允许但冲突图无法完全隔离时（如池数少于色数），算法仍分配全部引物，
+  不可避免的冲突通过 `conflicts` 如实返回。
+
 ## 配对结果字段含义
 
 | 字段 | 含义 |
@@ -200,9 +271,10 @@ app/
   config.py     # 环境变量配置
   iupac.py      # IUPAC 碱基集合与互补矩阵
   dimer.py      # 错位枚举、连续互补/3′端长度、风险判定、同分规则
+  pooling.py    # 异二聚体冲突图构建与 DSatur 风格确定性贪心分池
   schemas.py    # Pydantic 模型与输入校验
   db.py         # SQLite 建表、写入、查询
-  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）
+  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）、分池编排
   main.py       # FastAPI 路由
   cli.py        # initdb 命令
 tests/          # pytest 算法与 API 测试

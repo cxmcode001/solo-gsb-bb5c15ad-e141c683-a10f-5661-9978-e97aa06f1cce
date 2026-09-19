@@ -14,9 +14,11 @@ from .schemas import (
     BatchResult,
     BatchSummary,
     PairOut,
+    PoolPlanOut,
+    PoolPlanRequest,
     PrimerOut,
 )
-from .services import run_batch
+from .services import plan_batch_pools, run_batch
 
 
 @asynccontextmanager
@@ -127,6 +129,31 @@ def get_batch(
 
 def _summary(row) -> BatchSummary:
     return BatchSummary(**dict(row))
+
+
+@app.post(
+    "/api/batches/{batch_id}/pool-plan",
+    tags=["batches"],
+    summary="基于已保存批次的异二聚体结果做引物分池",
+    response_model=PoolPlanOut,
+    responses={
+        404: {"description": "批次不存在"},
+        422: {"description": "参数非法或池容量总和不足"},
+    },
+)
+def create_pool_plan(batch_id: str, payload: PoolPlanRequest) -> PoolPlanOut:
+    try:
+        result = plan_batch_pools(
+            batch_id=batch_id,
+            pool_count=payload.pool_count,
+            pool_capacity=payload.pool_capacity,
+            isolated_risk_levels=payload.isolated_risk_levels,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    return PoolPlanOut(**result)
 
 
 def _load_result(batch_id: str, *, risky_only: bool) -> BatchResult:
