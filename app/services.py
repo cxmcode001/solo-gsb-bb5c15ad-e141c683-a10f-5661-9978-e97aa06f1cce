@@ -7,6 +7,15 @@ import uuid
 
 from . import db
 from .dimer import PairResult, analyze_pair
+from .pooling import CapacityInsufficient, PoolPlan, plan_pools
+
+
+class BatchNotFound(Exception):
+    """批次不存在。"""
+
+    def __init__(self, batch_id: str) -> None:
+        super().__init__(f"批次不存在: {batch_id}")
+        self.batch_id = batch_id
 
 
 def _pair_to_row(pair_index: int, r: PairResult) -> tuple:
@@ -95,3 +104,45 @@ def run_batch(
             pair_rows=pair_rows,
         )
     return batch_id
+
+
+def build_pool_plan(
+    batch_id: str,
+    *,
+    pool_count: int,
+    pool_capacity: int,
+    isolate_risk_levels: list[str],
+) -> PoolPlan:
+    """为已保存批次构建异二聚体冲突图并分池。
+
+    自二聚体（is_self_dimer=1）不参与建图；异二聚体的风险等级命中
+    ``isolate_risk_levels`` 中任一等级时连一条冲突边。
+    批次不存在抛 ``BatchNotFound``；总容量不足抛 ``CapacityInsufficient``。
+    """
+    with db.get_conn() as conn:
+        batch = db.get_batch(conn, batch_id)
+        if batch is None:
+            raise BatchNotFound(batch_id)
+        primers = db.get_primers(conn, batch_id)
+        pairs = db.get_pairs(conn, batch_id, risky_only=False)
+
+    names = [row["name"] for row in primers]
+    name_to_pos = {row["name"]: row["position"] for row in primers}
+    levels = set(isolate_risk_levels)
+
+    conflicts: list[tuple[int, int, str]] = []
+    for row in pairs:
+        if row["is_self_dimer"]:
+            continue
+        if row["risk_level"] not in levels:
+            continue
+        pos_a = name_to_pos[row["name_top"]]
+        pos_b = name_to_pos[row["name_bottom"]]
+        conflicts.append((pos_a, pos_b, row["risk_level"]))
+
+    return plan_pools(
+        names,
+        conflicts,
+        pool_count=pool_count,
+        pool_capacity=pool_capacity,
+    )

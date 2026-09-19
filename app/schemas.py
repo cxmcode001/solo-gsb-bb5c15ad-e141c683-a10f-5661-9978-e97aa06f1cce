@@ -112,5 +112,73 @@ class BatchList(BaseModel):
     batches: list[BatchSummary]
 
 
+_RISK_LEVELS = {"high", "medium", "low"}
+
+
+class PoolPlanRequest(BaseModel):
+    pool_count: int = Field(
+        ..., ge=1, le=1000, description="池子数量（≥1）"
+    )
+    pool_capacity: int = Field(
+        ..., ge=1, le=100000, description="每个池子的容量（≥1，各池相同）"
+    )
+    isolate_risk_levels: list[str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "需隔离的风险等级（异二聚体命中其中任一等级即在冲突图中连边，"
+            "自二聚体忽略）；取值 high / medium / low，重复值自动去重"
+        ),
+    )
+
+    @field_validator("isolate_risk_levels")
+    @classmethod
+    def _isolate_risk_levels(cls, v: list[str]) -> list[str]:
+        levels = [s.strip().lower() for s in v]
+        bad = sorted({s for s in levels if s not in _RISK_LEVELS})
+        if bad:
+            raise ValueError(
+                "风险等级仅支持 high / medium / low，非法值: " + ", ".join(bad)
+            )
+        # 去重并保持首次出现顺序，保证相同语义输入结果稳定
+        return list(dict.fromkeys(levels))
+
+
+class PoolConflictEdgeOut(BaseModel):
+    position_a: int
+    position_b: int
+    name_a: str
+    name_b: str
+    risk_level: str
+
+
+class PoolOut(BaseModel):
+    pool_index: int
+    members: list[str] = Field(
+        description="池内引物名称（按批次位置升序）"
+    )
+    member_positions: list[int] = Field(
+        description="池内引物在批次中的位置（与 members 一一对应）"
+    )
+    conflicts: list[PoolConflictEdgeOut] = Field(
+        description="同池冲突边（两端引物被分入本池的冲突对）"
+    )
+
+
+class PoolPlanResult(BaseModel):
+    batch_id: str
+    pool_count: int
+    pool_capacity: int
+    isolate_risk_levels: list[str]
+    primer_count: int
+    conflict_edge_count: int = Field(
+        description="冲突图中的边数（命中隔离等级的异二聚体对数）"
+    )
+    total_conflicts: int = Field(
+        description="最终同池冲突边总数（各池 conflicts 长度之和）"
+    )
+    pools: list[PoolOut]
+
+
 class ErrorOut(BaseModel):
     detail: str

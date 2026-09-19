@@ -14,9 +14,13 @@ from .schemas import (
     BatchResult,
     BatchSummary,
     PairOut,
+    PoolConflictEdgeOut,
+    PoolOut,
+    PoolPlanRequest,
+    PoolPlanResult,
     PrimerOut,
 )
-from .services import run_batch
+from .services import build_pool_plan, run_batch
 
 
 @asynccontextmanager
@@ -123,6 +127,76 @@ def get_batch(
     ),
 ) -> BatchResult:
     return _load_result(batch_id, risky_only=risky_only)
+
+
+@app.post(
+    "/api/batches/{batch_id}/pool-plan",
+    tags=["batches"],
+    summary="基于异二聚体冲突图为已保存批次规划引物分池",
+    response_model=PoolPlanResult,
+    responses={
+        404: {"description": "批次不存在"},
+        422: {"description": "池子总容量不足或请求参数非法"},
+    },
+)
+def create_pool_plan(batch_id: str, payload: PoolPlanRequest) -> PoolPlanResult:
+    # 先确认批次存在，再给出容量结论，错误语义与文档一致
+    with db.get_conn() as conn:
+        batch = db.get_batch(conn, batch_id)
+        if batch is None:
+            raise HTTPException(status_code=404, detail="批次不存在")
+        primer_count = batch["primer_count"]
+
+    total_capacity = payload.pool_count * payload.pool_capacity
+    if total_capacity < primer_count:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"池子总容量 {total_capacity}（{payload.pool_count} 池 × "
+                f"{payload.pool_capacity}）不足以容纳 {primer_count} 个引物"
+            ),
+        )
+
+    plan = build_pool_plan(
+        batch_id,
+        pool_count=payload.pool_count,
+        pool_capacity=payload.pool_capacity,
+        isolate_risk_levels=payload.isolate_risk_levels,
+    )
+
+    with db.get_conn() as conn:
+        primers = db.get_primers(conn, batch_id)
+    pos_to_name = {row["position"]: row["name"] for row in primers}
+
+    pools = [
+        PoolOut(
+            pool_index=assignment.pool_index,
+            members=[pos_to_name[pos] for pos in assignment.members],
+            member_positions=assignment.members,
+            conflicts=[
+                PoolConflictEdgeOut(
+                    position_a=edge.position_a,
+                    position_b=edge.position_b,
+                    name_a=edge.name_a,
+                    name_b=edge.name_b,
+                    risk_level=edge.risk_level,
+                )
+                for edge in assignment.conflicts
+            ],
+        )
+        for assignment in plan.assignments
+    ]
+
+    return PoolPlanResult(
+        batch_id=batch_id,
+        pool_count=payload.pool_count,
+        pool_capacity=payload.pool_capacity,
+        isolate_risk_levels=payload.isolate_risk_levels,
+        primer_count=primer_count,
+        conflict_edge_count=plan.conflict_edge_count,
+        total_conflicts=plan.total_conflicts,
+        pools=pools,
+    )
 
 
 def _summary(row) -> BatchSummary:

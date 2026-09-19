@@ -15,7 +15,11 @@ SQLite，支持事后查询。
 docker compose up --build -d
 ```
 
-启动后访问：
+启动后服务监听宿主机 **8000 端口**（`docker-compose.yml` 中 `8000:8000`
+端口映射），在本机浏览器或命令行直接访问 `http://localhost:8000/...` 即可，
+无需额外端口或反向代理。
+
+访问入口：
 
 | 用途 | 地址 |
 | --- | --- |
@@ -119,6 +123,80 @@ curl -s -X POST http://localhost:8000/api/batches \
 
 ### `GET /api/batches?limit=50&offset=0` — 批次列表（按创建时间倒序）
 
+### `POST /api/batches/{id}/pool-plan` — 基于异二聚体冲突图的引物分池
+
+对**已保存批次**做分池规划：忽略全部自二聚体，把风险等级命中
+`isolate_risk_levels` 的**异二聚体**对连成无向冲突图，再用确定性贪心
+（类 DSATUR）把引物分入指定数量、统一容量的池子。
+
+* **选择下一个引物**（取最大）：已见邻池数（邻接引物已落入的不同池数）
+  → 冲突度（冲突图总度数）→ 批次位置（提交顺序靠前者优先）；
+* **选择放置池子**（取最小）：新增冲突数（与池内成员的冲突边数）
+  → 池内人数 → 池号；
+* 只要 `pool_count × pool_capacity ≥ 引物数`，全部引物必被分配；
+  同分全部由批次位置/池号兜底，**相同输入结果稳定可复现**。
+
+```bash
+curl -s -X POST http://localhost:8000/api/batches/$BID/pool-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "pool_count": 2,
+    "pool_capacity": 3,
+    "isolate_risk_levels": ["high"]
+  }'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `pool_count` | 池子数量，≥1（≤1000） |
+| `pool_capacity` | 每个池子的容量，≥1（≤100000），各池相同 |
+| `isolate_risk_levels` | 需隔离的风险等级列表，取值 `high` / `medium` / `low`；异二聚体命中其中任一等级即连冲突边；大小写不敏感、重复值自动去重，至少提供一个 |
+
+返回：各池成员（名称 + 批次位置）、**同池冲突边**（两端引物的名称、位置与风险等级）
+以及**总冲突数**（各池冲突边数之和）；空池同样返回。
+
+```json
+{
+  "batch_id": "115fdb0d-...",
+  "pool_count": 2,
+  "pool_capacity": 3,
+  "isolate_risk_levels": ["high"],
+  "primer_count": 6,
+  "conflict_edge_count": 4,
+  "total_conflicts": 1,
+  "pools": [
+    {
+      "pool_index": 0,
+      "members": ["F", "N1", "N2"],
+      "member_positions": [0, 4, 5],
+      "conflicts": [
+        {"position_a": 0, "position_b": 4, "name_a": "F", "name_b": "N1", "risk_level": "high"}
+      ]
+    },
+    {
+      "pool_index": 1,
+      "members": ["R", "X", "Q"],
+      "member_positions": [1, 2, 3],
+      "conflicts": []
+    }
+  ]
+}
+```
+
+错误：
+
+* 批次不存在：`404`（`{"detail": "批次不存在"}`）；
+* 池子总容量不足（`pool_count × pool_capacity < 引物数`）：`422`，
+  响应说明总容量与引物数，例如
+  `池子总容量 4（2 池 × 2）不足以容纳 6 个引物`；
+* 参数非法（池数/容量小于 1、空或非法的风险等级列表等）：`422`。
+
+> 示例中的 `$BID` 为 `POST /api/batches` 返回的批次 `id`。
+> 所有接口均通过 **8000** 端口访问，例如
+> http://localhost:8000/api/batches 与 http://localhost:8000/docs 。
+
 ## 配对结果字段含义
 
 | 字段 | 含义 |
@@ -200,9 +278,10 @@ app/
   config.py     # 环境变量配置
   iupac.py      # IUPAC 碱基集合与互补矩阵
   dimer.py      # 错位枚举、连续互补/3′端长度、风险判定、同分规则
+  pooling.py    # 异二聚体冲突图构建与确定性贪心分池（pool-plan）
   schemas.py    # Pydantic 模型与输入校验
   db.py         # SQLite 建表、写入、查询
-  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）
+  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）与分池加载
   main.py       # FastAPI 路由
   cli.py        # initdb 命令
 tests/          # pytest 算法与 API 测试
